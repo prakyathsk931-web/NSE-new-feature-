@@ -1,0 +1,1038 @@
+"""
+NSE Stock Analysis API  (v2.0)  — FastAPI + yfinance, 100% free
+================================================================================
+Original endpoints (kept, same URLs so your v0 app does not break):
+    GET /                       health check
+    GET /analyze/{symbol}       technicals + fundamentals (+ NEW signal_summary)
+    GET /chart/{symbol}         OHLC + indicators (+ NEW Bollinger band lines)
+    GET /watchlist?symbols=     multi-stock snapshot (+ NEW signal label)
+
+NEW endpoints (7 new features):
+    1. GET /risk/{symbol}             volatility, Sharpe, Sortino, max drawdown, VaR, beta vs NIFTY
+    2. GET /compare?symbols=          normalised performance + correlation matrix
+    3. GET /backtest/{symbol}         moving-average crossover strategy vs buy & hold
+    4. GET /valuation/{symbol}        P/E, P/B, EPS, dividend yield + dividend history
+    5. GET /news/{symbol}             latest headlines + keyword sentiment score
+    6. GET /forecast/{symbol}         Monte Carlo price simulation (probability bands)
+    7. GET /market-overview           NIFTY / SENSEX / BANK NIFTY / VIX / USDINR + top movers
+
+REQUIREMENTS (requirements.txt)
+    fastapi
+    uvicorn
+    yfinance
+    pandas
+    numpy
+
+RUN LOCALLY
+    uvicorn nse_analysis_api:app --reload --port 8000
+    open http://127.0.0.1:8000/docs   <- free interactive docs to test every endpoint
+
+RENDER START COMMAND
+    uvicorn nse_analysis_api:app --host 0.0.0.0 --port $PORT
+
+Educational project only — nothing here is investment advice.
+"""
+
+import time
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="NSE Stock Analysis API", version="2.0")
+
+# Allow any frontend (v0.dev, Lovable, or anywhere else) to call this API from the browser
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+TRADING_DAYS = 252
+RISK_FREE_RATE = 0.07          # ~India 10-year G-Sec yield; change if you want
+BENCHMARK = "^NSEI"            # NIFTY 50
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# HELPERS: caching + data loading
+# A tiny in-memory cache. Yahoo rate-limits free hosting IPs, so caching the
+# same data for a few minutes makes the app faster AND more reliable.
+# ══════════════════════════════════════════════════════════════════════════
+_CACHE = {}
+
+
+def cached(key, ttl_seconds, fn):
+    now = time.time()
+    hit = _CACHE.get(key)
+    if hit and now - hit[0] < ttl_seconds:
+        return hit[1]
+    value = fn()
+    _CACHE[key] = (now, value)
+    return value
+
+
+def to_ticker(symbol: str) -> str:
+    s = symbol.upper().strip()
+    if s.startswith("^") or s.endswith(".NS") or s.endswith(".BO") or s.endswith("=X"):
+        return s
+    return f"{s}.NS"
+
+
+def get_history(ticker: str, period: str = "2y") -> pd.DataFrame:
+    """Price history with a timezone-free daily index, cached for 10 minutes."""
+    def _fetch():
+        df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+        if not df.empty:
+            df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+        return df
+    return cached(f"hist:{ticker}:{period}", 600, _fetch).copy()
+
+
+def load_history(symbol: str, period: str = "2y"):
+    ticker = to_ticker(symbol)
+    hist = get_history(ticker, period)
+    if hist.empty:
+        raise HTTPException(status_code=404, detail=f"No data found for {ticker}. Check the symbol is correct.")
+    return ticker, hist
+
+
+def safe_round(val, decimals=2):
+    if val is None or pd.isna(val):
+        return None
+    return round(float(val), decimals)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# INDICATOR FUNCTIONS (unchanged from version 1)
+# ══════════════════════════════════════════════════════════════════════════
+
+def calculate_rsi(prices, period=14):
+    delta = prices.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def calculate_roc(prices, period=12):
+    return prices.pct_change(period) * 100
+
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    ema_fast = prices.ewm(span=fast, adjust=False).mean()
+    ema_slow = prices.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line, macd_line - signal_line
+
+
+def calculate_moving_averages(prices, short_window=50, long_window=200):
+    ma_short = prices.rolling(short_window).mean()
+    ma_long = prices.rolling(long_window).mean()
+    return ma_short, ma_long
+
+
+def calculate_adx(high, low, close, period=14):
+    plus_dm = high.diff(); minus_dm = -low.diff()
+    plus_dm[plus_dm < 0] = 0; minus_dm[minus_dm < 0] = 0
+    plus_dm[(plus_dm - minus_dm) < 0] = 0; minus_dm[(minus_dm - plus_dm) < 0] = 0
+    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+
+
+def calculate_52w_high_proximity(prices, window=252):
+    return (prices / prices.rolling(window).max()) * 100
+
+
+def calculate_bollinger_bands(prices, window=20, num_std=2):
+    middle = prices.rolling(window).mean()
+    std = prices.rolling(window).std()
+    upper = middle + (num_std * std)
+    lower = middle - (num_std * std)
+    percent_b = (prices - lower) / (upper - lower)
+    bandwidth = (upper - lower) / middle * 100
+    return percent_b, bandwidth
+
+
+def bollinger_lines(prices, window=20, num_std=2):
+    """NEW: the actual upper/lower band lines, for drawing on a chart."""
+    middle = prices.rolling(window).mean()
+    std = prices.rolling(window).std()
+    return middle + num_std * std, middle - num_std * std
+
+
+def get_yoy_earnings_growth(net_income, tolerance_days=45):
+    """Date-matched YoY growth (fixes irregularly reported quarters)."""
+    if len(net_income) < 2:
+        return None, None
+    latest_date = net_income.index[0]
+    latest_val = net_income.iloc[0]
+    target_date = latest_date - pd.DateOffset(months=12)
+    date_diffs = (net_income.index - target_date).days.to_series(index=net_income.index).abs()
+    closest_idx = date_diffs.idxmin()
+    if date_diffs[closest_idx] > tolerance_days:
+        return None, None
+    base_val = net_income.loc[closest_idx]
+    if base_val == 0 or pd.isna(base_val):
+        return None, None
+    return round(((latest_val / base_val) - 1) * 100, 2), str(closest_idx.date())
+
+
+def get_yoy_revenue_growth(revenue, tolerance_days=45):
+    return get_yoy_earnings_growth(revenue, tolerance_days)
+
+
+def get_fundamentals(stock):
+    """Fundamentals computed from statements (avoids the blocked stock.info endpoint)."""
+    fundamentals = {
+        "yoy_earnings_growth_pct": None,
+        "earnings_base_quarter": None,
+        "yoy_revenue_growth_pct": None,
+        "revenue_base_quarter": None,
+        "operating_margin_pct": None,
+        "net_margin_pct": None,
+        "roe_pct": None,
+        "debt_to_equity": None,
+        "market_cap_cr": None,
+    }
+
+    latest_revenue = None
+    latest_net_income = None
+    latest_operating_income = None
+
+    try:
+        income_stmt = stock.quarterly_income_stmt
+        if income_stmt is not None:
+            if "Net Income" in income_stmt.index:
+                net_income = income_stmt.loc["Net Income"].dropna()
+                growth, base_date = get_yoy_earnings_growth(net_income)
+                fundamentals["yoy_earnings_growth_pct"] = growth
+                fundamentals["earnings_base_quarter"] = base_date
+                if len(net_income) > 0:
+                    latest_net_income = net_income.iloc[0]
+
+            if "Total Revenue" in income_stmt.index:
+                revenue = income_stmt.loc["Total Revenue"].dropna()
+                growth, base_date = get_yoy_revenue_growth(revenue)
+                fundamentals["yoy_revenue_growth_pct"] = growth
+                fundamentals["revenue_base_quarter"] = base_date
+                if len(revenue) > 0:
+                    latest_revenue = revenue.iloc[0]
+
+            if "Operating Income" in income_stmt.index:
+                op_income = income_stmt.loc["Operating Income"].dropna()
+                if len(op_income) > 0:
+                    latest_operating_income = op_income.iloc[0]
+
+        if latest_revenue and latest_revenue != 0:
+            if latest_net_income is not None:
+                fundamentals["net_margin_pct"] = safe_round((latest_net_income / latest_revenue) * 100)
+            if latest_operating_income is not None:
+                fundamentals["operating_margin_pct"] = safe_round((latest_operating_income / latest_revenue) * 100)
+
+    except Exception as e:
+        fundamentals["_debug_income_stmt_error"] = str(e)
+
+    try:
+        balance_sheet = stock.quarterly_balance_sheet
+        if balance_sheet is not None:
+            equity = None
+            total_debt = None
+
+            for equity_label in ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]:
+                if equity_label in balance_sheet.index:
+                    equity_series = balance_sheet.loc[equity_label].dropna()
+                    if len(equity_series) > 0:
+                        equity = equity_series.iloc[0]
+                        break
+
+            for debt_label in ["Total Debt", "Net Debt"]:
+                if debt_label in balance_sheet.index:
+                    debt_series = balance_sheet.loc[debt_label].dropna()
+                    if len(debt_series) > 0:
+                        total_debt = debt_series.iloc[0]
+                        break
+
+            if equity and equity != 0:
+                if total_debt is not None:
+                    fundamentals["debt_to_equity"] = safe_round(total_debt / equity)
+                if latest_net_income is not None:
+                    fundamentals["roe_pct"] = safe_round(((latest_net_income * 4) / equity) * 100)
+
+    except Exception as e:
+        fundamentals["_debug_balance_sheet_error"] = str(e)
+
+    try:
+        fast_info = stock.fast_info
+        if fast_info and fast_info.get("marketCap"):
+            fundamentals["market_cap_cr"] = safe_round(fast_info["marketCap"] / 1e7)
+    except Exception:
+        pass
+
+    return fundamentals
+
+
+def get_technical_snapshot(hist):
+    """Core technical calculation, shared by /analyze and /watchlist."""
+    close = hist["Close"]
+    high = hist["High"]
+    low = hist["Low"]
+
+    daily_pct_change = close.pct_change()
+    corporate_action_flag = bool((daily_pct_change.abs() > 0.15).any())
+
+    rsi = calculate_rsi(close)
+    roc = calculate_roc(close)
+    macd_line, signal_line, macd_hist = calculate_macd(close)
+    ma50, ma200 = calculate_moving_averages(close)
+    adx = calculate_adx(high, low, close)
+    high52 = calculate_52w_high_proximity(close)
+    percent_b, bandwidth = calculate_bollinger_bands(close)
+
+    ma_trend = None
+    if not pd.isna(ma50.iloc[-1]) and not pd.isna(ma200.iloc[-1]):
+        ma_trend = "bullish" if ma50.iloc[-1] > ma200.iloc[-1] else "bearish"
+
+    technical = {
+        "current_price": safe_round(close.iloc[-1]),
+        "rsi_14": safe_round(rsi.iloc[-1]),
+        "roc_12": safe_round(roc.iloc[-1]),
+        "macd_line": safe_round(macd_line.iloc[-1]),
+        "macd_signal": safe_round(signal_line.iloc[-1]),
+        "macd_histogram": safe_round(macd_hist.iloc[-1]),
+        "ma_50": safe_round(ma50.iloc[-1]),
+        "ma_200": safe_round(ma200.iloc[-1]),
+        "ma_trend": ma_trend,
+        "adx_14": safe_round(adx.iloc[-1]),
+        "pct_of_52w_high": safe_round(high52.iloc[-1]),
+        "bollinger_percent_b": safe_round(percent_b.iloc[-1], 3),
+        "bollinger_bandwidth_pct": safe_round(bandwidth.iloc[-1]),
+    }
+    return technical, corporate_action_flag
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW: SIGNAL SCORECARD (added to /analyze and /watchlist)
+# Each indicator votes +1 (bullish), -1 (bearish) or 0 (neutral).
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_signal_summary(t):
+    votes = []
+
+    def vote(name, score, reason):
+        votes.append({"indicator": name, "score": score, "reason": reason})
+
+    rsi = t.get("rsi_14")
+    if rsi is not None:
+        if rsi < 30:
+            vote("RSI", 1, f"RSI {rsi} is oversold (<30)")
+        elif rsi > 70:
+            vote("RSI", -1, f"RSI {rsi} is overbought (>70)")
+        else:
+            vote("RSI", 0, f"RSI {rsi} is in the neutral zone")
+
+    hist_val = t.get("macd_histogram")
+    if hist_val is not None:
+        if hist_val > 0:
+            vote("MACD", 1, "MACD is above its signal line")
+        else:
+            vote("MACD", -1, "MACD is below its signal line")
+
+    if t.get("ma_trend"):
+        vote("50/200 MA", 1 if t["ma_trend"] == "bullish" else -1,
+             f"50-day average is {'above' if t['ma_trend'] == 'bullish' else 'below'} the 200-day average")
+
+    price, ma50 = t.get("current_price"), t.get("ma_50")
+    if price is not None and ma50 is not None:
+        vote("Price vs 50 MA", 1 if price > ma50 else -1,
+             f"Price is {'above' if price > ma50 else 'below'} the 50-day average")
+
+    pb = t.get("bollinger_percent_b")
+    if pb is not None:
+        if pb < 0.2:
+            vote("Bollinger", 1, "Price is near the lower band (possible bounce)")
+        elif pb > 0.8:
+            vote("Bollinger", -1, "Price is near the upper band (stretched)")
+        else:
+            vote("Bollinger", 0, "Price is inside the bands")
+
+    roc = t.get("roc_12")
+    if roc is not None:
+        vote("Momentum (ROC)", 1 if roc > 0 else -1,
+             f"12-day rate of change is {'positive' if roc > 0 else 'negative'}")
+
+    total = sum(v["score"] for v in votes)
+    if total >= 3:
+        label = "Bullish"
+    elif total >= 1:
+        label = "Mildly Bullish"
+    elif total == 0:
+        label = "Neutral"
+    elif total >= -2:
+        label = "Mildly Bearish"
+    else:
+        label = "Bearish"
+
+    return {"score": total, "max_score": len(votes), "label": label, "votes": votes}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ORIGINAL ENDPOINTS (URLs unchanged)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "NSE Stock Analysis API v2.0 is running"}
+
+
+@app.get("/analyze/{symbol}")
+def analyze_stock(symbol: str):
+    """Full technical + fundamental analysis for one NSE-listed company."""
+    try:
+        ticker, hist = load_history(symbol, "2y")
+        stock = yf.Ticker(ticker)
+
+        technical, corporate_action_flag = get_technical_snapshot(hist)
+        fundamentals = get_fundamentals(stock)
+
+        return {
+            "symbol": ticker,
+            "company_name": ticker,
+            "timestamp": datetime.now().isoformat(),
+            "corporate_action_flag": corporate_action_flag,
+            "corporate_action_note": (
+                "A >15% single-day price move was detected in the last 2 years — "
+                "moving-average and Bollinger figures may be distorted by a demerger, "
+                "split, or similar event. Verify before trusting the technical signals."
+                if corporate_action_flag else None
+            ),
+            "technical": technical,
+            "fundamentals": fundamentals,
+            "signal_summary": build_signal_summary(technical),   # NEW
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analyzing {symbol}: {str(e)}")
+
+
+@app.get("/chart/{symbol}")
+def chart_data(symbol: str, months: int = 6):
+    """OHLC + indicator series for charting (now includes Bollinger band lines)."""
+    months = min(max(months, 1), 24)
+    try:
+        ticker, hist = load_history(symbol, "2y")
+
+        close = hist["Close"]
+        rsi = calculate_rsi(close)
+        macd_line, signal_line, _ = calculate_macd(close)
+        ma50, ma200 = calculate_moving_averages(close)
+        bb_upper, bb_lower = bollinger_lines(close)
+
+        recent = hist.tail(months * 21)
+
+        rows = []
+        for date, row in recent.iterrows():
+            rows.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "open": safe_round(row["Open"]),
+                "high": safe_round(row["High"]),
+                "low": safe_round(row["Low"]),
+                "close": safe_round(row["Close"]),
+                "volume": int(row["Volume"]) if not pd.isna(row["Volume"]) else None,
+                "rsi": safe_round(rsi.loc[date]),
+                "macd_line": safe_round(macd_line.loc[date]),
+                "macd_signal": safe_round(signal_line.loc[date]),
+                "ma_50": safe_round(ma50.loc[date]),
+                "ma_200": safe_round(ma200.loc[date]),
+                "bb_upper": safe_round(bb_upper.loc[date]),   # NEW
+                "bb_lower": safe_round(bb_lower.loc[date]),   # NEW
+            })
+
+        return {"symbol": ticker, "months": months, "data": rows}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching chart data for {symbol}: {str(e)}")
+
+
+@app.get("/watchlist")
+def watchlist(symbols: str):
+    """Multi-stock snapshot: /watchlist?symbols=RELIANCE,TCS,INFY (max 10)."""
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:10]
+    if not symbol_list:
+        raise HTTPException(status_code=400, detail="Provide at least one symbol, e.g. ?symbols=RELIANCE,TCS")
+
+    def one(symbol):
+        ticker = to_ticker(symbol)
+        try:
+            hist = get_history(ticker, "2y")
+            if hist.empty:
+                return {"symbol": ticker, "error": "No data found"}
+            technical, flag = get_technical_snapshot(hist)
+            signal = build_signal_summary(technical)
+            return {
+                "symbol": ticker,
+                "company_name": ticker,
+                "current_price": technical["current_price"],
+                "rsi_14": technical["rsi_14"],
+                "macd_histogram": technical["macd_histogram"],
+                "ma_trend": technical["ma_trend"],
+                "pct_of_52w_high": technical["pct_of_52w_high"],
+                "corporate_action_flag": flag,
+                "signal_label": signal["label"],          # NEW
+                "signal_score": signal["score"],          # NEW
+            }
+        except Exception as e:
+            return {"symbol": ticker, "error": str(e)}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(one, symbol_list))
+
+    return {"count": len(results), "stocks": results}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW FEATURE 1 — RISK METRICS
+# ══════════════════════════════════════════════════════════════════════════
+
+def max_drawdown(series):
+    """Largest peak-to-trough fall, in %, with peak/trough dates."""
+    running_max = series.cummax()
+    drawdown = series / running_max - 1
+    trough_date = drawdown.idxmin()
+    peak_date = series.loc[:trough_date].idxmax()
+    return float(drawdown.min() * 100), peak_date, trough_date
+
+
+@app.get("/risk/{symbol}")
+def risk_metrics(symbol: str, years: int = 2):
+    """Volatility, Sharpe, Sortino, max drawdown, VaR and beta vs NIFTY 50."""
+    years = min(max(years, 1), 5)
+    try:
+        ticker, hist = load_history(symbol, f"{years}y")
+        close = hist["Close"]
+        returns = close.pct_change().dropna()
+        if len(returns) < 30:
+            raise HTTPException(status_code=422, detail="Not enough price history to compute risk metrics.")
+
+        ann_vol = returns.std() * np.sqrt(TRADING_DAYS)
+        n_years = len(returns) / TRADING_DAYS
+        cagr = (close.iloc[-1] / close.iloc[0]) ** (1 / n_years) - 1
+
+        sharpe = (cagr - RISK_FREE_RATE) / ann_vol if ann_vol else None
+
+        downside = returns[returns < 0]
+        downside_dev = downside.std() * np.sqrt(TRADING_DAYS) if len(downside) > 1 else None
+        sortino = (cagr - RISK_FREE_RATE) / downside_dev if downside_dev else None
+
+        mdd, peak_date, trough_date = max_drawdown(close)
+        var_95 = np.percentile(returns, 5) * 100
+        var_99 = np.percentile(returns, 1) * 100
+
+        # beta and correlation vs NIFTY 50
+        beta = correlation = None
+        try:
+            bench = get_history(BENCHMARK, f"{years}y")["Close"].pct_change().dropna()
+            joined = pd.concat([returns, bench], axis=1, join="inner").dropna()
+            joined.columns = ["stock", "bench"]
+            if len(joined) > 30 and joined["bench"].var() > 0:
+                beta = joined["stock"].cov(joined["bench"]) / joined["bench"].var()
+                correlation = joined["stock"].corr(joined["bench"])
+        except Exception:
+            pass
+
+        if ann_vol < 0.20:
+            risk_level = "Low"
+        elif ann_vol < 0.35:
+            risk_level = "Moderate"
+        else:
+            risk_level = "High"
+
+        return {
+            "symbol": ticker,
+            "years": years,
+            "risk_free_rate_pct": RISK_FREE_RATE * 100,
+            "annualised_return_cagr_pct": safe_round(cagr * 100),
+            "annualised_volatility_pct": safe_round(ann_vol * 100),
+            "sharpe_ratio": safe_round(sharpe),
+            "sortino_ratio": safe_round(sortino),
+            "max_drawdown_pct": safe_round(mdd),
+            "max_drawdown_peak_date": str(peak_date.date()),
+            "max_drawdown_trough_date": str(trough_date.date()),
+            "var_95_daily_pct": safe_round(var_95),
+            "var_99_daily_pct": safe_round(var_99),
+            "beta_vs_nifty": safe_round(beta),
+            "correlation_vs_nifty": safe_round(correlation),
+            "risk_level": risk_level,
+            "best_day_pct": safe_round(returns.max() * 100),
+            "worst_day_pct": safe_round(returns.min() * 100),
+            "positive_days_pct": safe_round((returns > 0).mean() * 100),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error computing risk for {symbol}: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW FEATURE 2 — COMPARE STOCKS (performance + correlation matrix)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.get("/compare")
+def compare_stocks(symbols: str, years: int = 1):
+    """/compare?symbols=TCS,INFY,WIPRO&years=1 — rebased-to-100 chart data + correlations."""
+    years = min(max(years, 1), 5)
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:6]
+    if len(symbol_list) < 2:
+        raise HTTPException(status_code=400, detail="Provide at least 2 symbols, e.g. ?symbols=TCS,INFY")
+
+    try:
+        closes, errors = {}, []
+        for s in symbol_list:
+            ticker = to_ticker(s)
+            h = get_history(ticker, f"{years}y")
+            if h.empty:
+                errors.append(f"No data for {ticker}")
+            else:
+                closes[ticker] = h["Close"]
+        if len(closes) < 2:
+            raise HTTPException(status_code=404, detail=f"Need at least 2 valid symbols. {errors}")
+
+        df = pd.DataFrame(closes).dropna()
+        if len(df) < 20:
+            raise HTTPException(status_code=422, detail="Not enough overlapping history to compare.")
+
+        rebased = df / df.iloc[0] * 100
+        returns = df.pct_change().dropna()
+        corr = returns.corr()
+
+        summary = []
+        for t in df.columns:
+            r = returns[t]
+            summary.append({
+                "symbol": t,
+                "total_return_pct": safe_round((df[t].iloc[-1] / df[t].iloc[0] - 1) * 100),
+                "volatility_pct": safe_round(r.std() * np.sqrt(TRADING_DAYS) * 100),
+                "max_drawdown_pct": safe_round(max_drawdown(df[t])[0]),
+            })
+        summary.sort(key=lambda x: x["total_return_pct"] or -999, reverse=True)
+
+        series = [
+            {"date": d.strftime("%Y-%m-%d"), **{c: safe_round(rebased.loc[d, c]) for c in rebased.columns}}
+            for d in rebased.index
+        ]
+        pairs = []
+        cols = list(corr.columns)
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                pairs.append({"a": cols[i], "b": cols[j], "correlation": safe_round(corr.iloc[i, j])})
+
+        return {
+            "symbols": list(df.columns),
+            "years": years,
+            "warnings": errors,
+            "summary": summary,
+            "best_performer": summary[0]["symbol"],
+            "worst_performer": summary[-1]["symbol"],
+            "correlation_matrix": {c: {r: safe_round(corr.loc[r, c]) for r in cols} for c in cols},
+            "correlation_pairs": pairs,
+            "rebased_series": series,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error comparing stocks: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW FEATURE 3 — BACKTEST (moving-average crossover vs buy & hold)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.get("/backtest/{symbol}")
+def backtest(symbol: str, short: int = 50, long: int = 200, years: int = 3,
+             capital: float = 100000, cost_pct: float = 0.1):
+    """
+    Strategy: hold the stock while the short MA is above the long MA, otherwise stay in cash.
+    Signals are applied from the NEXT day (no look-ahead cheating). cost_pct = cost per trade in %.
+    """
+    years = min(max(years, 1), 5)
+    short = max(5, min(short, 100))
+    long = max(short + 5, min(long, 250))
+    try:
+        ticker, hist = load_history(symbol, "10y")
+        close = hist["Close"]
+
+        ma_s = close.rolling(short).mean()
+        ma_l = close.rolling(long).mean()
+        position = (ma_s > ma_l).astype(int).shift(1).fillna(0)
+
+        daily_ret = close.pct_change().fillna(0)
+        trades_flag = position.diff().abs().fillna(0)
+        strat_ret = position * daily_ret - trades_flag * (cost_pct / 100)
+
+        window = close.index[-years * TRADING_DAYS:]
+        daily_ret_w, strat_ret_w, pos_w = daily_ret.loc[window], strat_ret.loc[window], position.loc[window]
+
+        bh_curve = capital * (1 + daily_ret_w).cumprod()
+        st_curve = capital * (1 + strat_ret_w).cumprod()
+
+        # trade-level stats
+        trade_id = (pos_w.diff().fillna(pos_w.iloc[0]) == 1).cumsum()
+        in_pos = pos_w == 1
+        trade_returns = (1 + daily_ret_w[in_pos]).groupby(trade_id[in_pos]).prod() - 1
+        num_trades = int(len(trade_returns))
+        win_rate = float((trade_returns > 0).mean() * 100) if num_trades else None
+
+        def stats(curve):
+            n_years = len(curve) / TRADING_DAYS
+            total = curve.iloc[-1] / capital - 1
+            cagr = (curve.iloc[-1] / capital) ** (1 / n_years) - 1
+            return {
+                "final_value": safe_round(curve.iloc[-1]),
+                "total_return_pct": safe_round(total * 100),
+                "cagr_pct": safe_round(cagr * 100),
+                "max_drawdown_pct": safe_round(max_drawdown(curve)[0]),
+            }
+
+        strategy, buyhold = stats(st_curve), stats(bh_curve)
+        verdict = ("Strategy beat buy & hold" if strategy["total_return_pct"] > buyhold["total_return_pct"]
+                   else "Buy & hold beat the strategy")
+
+        step = max(1, len(window) // 300)   # keep payload small for charts
+        curve = [
+            {"date": d.strftime("%Y-%m-%d"), "strategy": safe_round(st_curve.loc[d]),
+             "buy_and_hold": safe_round(bh_curve.loc[d]), "in_market": bool(pos_w.loc[d])}
+            for d in window[::step]
+        ]
+
+        return {
+            "symbol": ticker,
+            "strategy_name": f"{short}/{long} day MA crossover",
+            "years": years,
+            "initial_capital": capital,
+            "cost_per_trade_pct": cost_pct,
+            "strategy": strategy,
+            "buy_and_hold": buyhold,
+            "number_of_trades": num_trades,
+            "win_rate_pct": safe_round(win_rate),
+            "time_in_market_pct": safe_round(pos_w.mean() * 100),
+            "verdict": verdict,
+            "equity_curve": curve,
+            "disclaimer": "Past performance does not predict future returns. Educational use only.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error backtesting {symbol}: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW FEATURE 4 — VALUATION & DIVIDENDS (calculated, no stock.info needed)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.get("/valuation/{symbol}")
+def valuation(symbol: str):
+    """P/E, P/B, EPS, dividend yield and dividend history."""
+    try:
+        ticker, hist = load_history(symbol, "2y")
+        stock = yf.Ticker(ticker)
+        price = float(hist["Close"].iloc[-1])
+
+        market_cap = shares = None
+        try:
+            fi = stock.fast_info
+            market_cap = fi.get("marketCap")
+            shares = fi.get("shares")
+        except Exception:
+            pass
+        if not market_cap and shares:
+            market_cap = shares * price
+        if not shares and market_cap:
+            shares = market_cap / price
+
+        ttm_net_income = equity = None
+        try:
+            inc = stock.quarterly_income_stmt
+            if inc is not None and "Net Income" in inc.index:
+                ni = inc.loc["Net Income"].dropna()
+                if len(ni) >= 4:
+                    ttm_net_income = float(ni.iloc[:4].sum())
+        except Exception:
+            pass
+        try:
+            bs = stock.quarterly_balance_sheet
+            if bs is not None:
+                for label in ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]:
+                    if label in bs.index:
+                        s = bs.loc[label].dropna()
+                        if len(s) > 0:
+                            equity = float(s.iloc[0])
+                            break
+        except Exception:
+            pass
+
+        pe = pb = eps = None
+        if market_cap and ttm_net_income and ttm_net_income > 0:
+            pe = market_cap / ttm_net_income
+        if market_cap and equity and equity > 0:
+            pb = market_cap / equity
+        if shares and ttm_net_income:
+            eps = ttm_net_income / shares
+
+        dividends, div_yield, history = None, None, []
+        try:
+            div = stock.dividends
+            if div is not None and len(div) > 0:
+                div.index = pd.to_datetime(div.index).tz_localize(None)
+                last_12m = div[div.index >= (pd.Timestamp.now() - pd.DateOffset(months=12))]
+                dividends = float(last_12m.sum())
+                div_yield = dividends / price * 100
+                history = [{"date": str(d.date()), "dividend_per_share": safe_round(v)}
+                           for d, v in div.tail(8).items()][::-1]
+        except Exception:
+            pass
+
+        if pe is None:
+            pe_view = None
+        elif pe < 15:
+            pe_view = "Low P/E (could be cheap or low-growth)"
+        elif pe < 30:
+            pe_view = "Moderate P/E"
+        else:
+            pe_view = "High P/E (market expects strong growth)"
+
+        window = hist["Close"].tail(252)
+        return {
+            "symbol": ticker,
+            "price": safe_round(price),
+            "market_cap_cr": safe_round(market_cap / 1e7) if market_cap else None,
+            "pe_ratio_ttm": safe_round(pe),
+            "pb_ratio": safe_round(pb),
+            "eps_ttm": safe_round(eps),
+            "dividend_per_share_12m": safe_round(dividends),
+            "dividend_yield_pct": safe_round(div_yield),
+            "week52_high": safe_round(window.max()),
+            "week52_low": safe_round(window.min()),
+            "pct_from_52w_high": safe_round((price / window.max() - 1) * 100),
+            "pe_view": pe_view,
+            "recent_dividends": history,
+            "note": "Ratios are calculated from the latest 4 quarters of reported statements. "
+                    "P/E is only meaningful for profitable companies; compare within the same sector.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error computing valuation for {symbol}: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW FEATURE 5 — NEWS + SIMPLE SENTIMENT (keyword based, no paid AI needed)
+# ══════════════════════════════════════════════════════════════════════════
+
+POSITIVE_WORDS = {
+    "surge", "surges", "jump", "jumps", "rally", "rallies", "gain", "gains", "profit", "growth", "record",
+    "beat", "beats", "upgrade", "upgrades", "buy", "bullish", "strong", "rise", "rises", "soar", "soars",
+    "outperform", "win", "wins", "order", "dividend", "expansion", "boost", "high", "positive", "recovery",
+}
+NEGATIVE_WORDS = {
+    "fall", "falls", "drop", "drops", "slump", "plunge", "plunges", "loss", "losses", "miss", "misses",
+    "downgrade", "downgrades", "sell", "bearish", "weak", "decline", "declines", "crash", "probe", "fraud",
+    "penalty", "fine", "lawsuit", "debt", "cut", "cuts", "low", "negative", "concern", "concerns", "risk",
+}
+
+
+def score_headline(text):
+    words = {w.strip(".,:;!?'\"()-").lower() for w in text.split()}
+    pos, neg = len(words & POSITIVE_WORDS), len(words & NEGATIVE_WORDS)
+    if pos > neg:
+        return 1
+    if neg > pos:
+        return -1
+    return 0
+
+
+@app.get("/news/{symbol}")
+def stock_news(symbol: str, limit: int = 10):
+    """Latest headlines from Yahoo Finance with a simple positive/negative tag."""
+    limit = min(max(limit, 1), 20)
+    ticker = to_ticker(symbol)
+    try:
+        try:
+            raw = cached(f"news:{ticker}", 600, lambda: yf.Ticker(ticker).news or [])
+        except Exception:
+            raw = []   # Yahoo sometimes blocks cloud IPs; return an empty list instead of crashing
+        items = []
+        for n in raw[:limit]:
+            c = n.get("content", n)   # yfinance changed its news format; handle both
+            title = c.get("title")
+            if not title:
+                continue
+            link = ((c.get("canonicalUrl") or {}).get("url")) or c.get("link")
+            publisher = ((c.get("provider") or {}).get("displayName")) or c.get("publisher")
+            published = c.get("pubDate")
+            if not published and c.get("providerPublishTime"):
+                published = datetime.fromtimestamp(c["providerPublishTime"]).isoformat()
+            s = score_headline(title + " " + (c.get("summary") or ""))
+            items.append({
+                "title": title,
+                "publisher": publisher,
+                "published": published,
+                "link": link,
+                "sentiment": {1: "positive", -1: "negative", 0: "neutral"}[s],
+            })
+
+        total = sum(1 if i["sentiment"] == "positive" else -1 if i["sentiment"] == "negative" else 0 for i in items)
+        overall = "Positive" if total > 0 else "Negative" if total < 0 else "Neutral"
+        return {
+            "symbol": ticker,
+            "count": len(items),
+            "overall_sentiment": overall if items else None,
+            "positive": sum(i["sentiment"] == "positive" for i in items),
+            "negative": sum(i["sentiment"] == "negative" for i in items),
+            "neutral": sum(i["sentiment"] == "neutral" for i in items),
+            "articles": items,
+            "note": "Sentiment is a simple keyword count, so treat it as a rough indicator only.",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching news for {symbol}: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW FEATURE 6 — MONTE CARLO PRICE FORECAST
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.get("/forecast/{symbol}")
+def forecast(symbol: str, days: int = 30, simulations: int = 1000):
+    """Simulates thousands of possible price paths using the stock's own historical return & volatility."""
+    days = min(max(days, 5), 90)
+    simulations = min(max(simulations, 200), 3000)
+    try:
+        ticker, hist = load_history(symbol, "2y")
+        close = hist["Close"]
+        log_ret = np.log(close / close.shift(1)).dropna()
+        mu, sigma = log_ret.mean(), log_ret.std()
+        last_price = float(close.iloc[-1])
+
+        rng = np.random.default_rng(42)
+        shocks = rng.normal(mu, sigma, size=(simulations, days))
+        paths = last_price * np.exp(np.cumsum(shocks, axis=1))
+
+        dates = pd.bdate_range(start=close.index[-1] + pd.Timedelta(days=1), periods=days)
+        pcts = {p: np.percentile(paths, p, axis=0) for p in (5, 25, 50, 75, 95)}
+        bands = [
+            {"date": d.strftime("%Y-%m-%d"),
+             "p5": safe_round(pcts[5][i]), "p25": safe_round(pcts[25][i]), "median": safe_round(pcts[50][i]),
+             "p75": safe_round(pcts[75][i]), "p95": safe_round(pcts[95][i])}
+            for i, d in enumerate(dates)
+        ]
+
+        final = paths[:, -1]
+        return {
+            "symbol": ticker,
+            "current_price": safe_round(last_price),
+            "days": days,
+            "simulations": simulations,
+            "daily_volatility_pct": safe_round(sigma * 100),
+            "expected_price": safe_round(final.mean()),
+            "median_price": safe_round(np.median(final)),
+            "best_case_p95": safe_round(np.percentile(final, 95)),
+            "worst_case_p5": safe_round(np.percentile(final, 5)),
+            "probability_of_gain_pct": safe_round((final > last_price).mean() * 100),
+            "probability_of_10pct_gain_pct": safe_round((final > last_price * 1.10).mean() * 100),
+            "probability_of_10pct_loss_pct": safe_round((final < last_price * 0.90).mean() * 100),
+            "bands": bands,
+            "disclaimer": "Statistical simulation based on past behaviour, not a prediction. Educational use only.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error forecasting {symbol}: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW FEATURE 7 — MARKET OVERVIEW (indices + top movers)
+# ══════════════════════════════════════════════════════════════════════════
+
+INDICES = {
+    "NIFTY 50": "^NSEI",
+    "SENSEX": "^BSESN",
+    "BANK NIFTY": "^NSEBANK",
+    "NIFTY IT": "^CNXIT",
+    "INDIA VIX": "^INDIAVIX",
+    "USD/INR": "INR=X",
+}
+
+MOVER_BASKET = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC", "LT", "AXISBANK",
+    "KOTAKBANK", "HINDUNILVR", "MARUTI", "SUNPHARMA", "TATAMOTORS", "ADANIENT", "WIPRO", "ONGC", "TITAN", "ASIANPAINT",
+]
+
+
+def quick_change(ticker, period="3mo"):
+    h = get_history(ticker, period)
+    if h.empty or len(h) < 2:
+        return None
+    c = h["Close"]
+    month_base = c.iloc[-22] if len(c) > 22 else c.iloc[0]
+    return {
+        "price": safe_round(c.iloc[-1]),
+        "change_pct": safe_round((c.iloc[-1] / c.iloc[-2] - 1) * 100),
+        "change_1m_pct": safe_round((c.iloc[-1] / month_base - 1) * 100),
+        "as_of": c.index[-1].strftime("%Y-%m-%d"),
+    }
+
+
+@app.get("/market-overview")
+def market_overview(movers: bool = True):
+    """Index snapshot + top gainers/losers from a basket of 20 large caps."""
+    def idx(item):
+        name, t = item
+        try:
+            data = quick_change(t)
+            return {"name": name, "symbol": t, **data} if data else {"name": name, "symbol": t, "error": "No data"}
+        except Exception as e:
+            return {"name": name, "symbol": t, "error": str(e)}
+
+    def stk(sym):
+        t = to_ticker(sym)
+        try:
+            data = quick_change(t)
+            return {"symbol": t, **data} if data else None
+        except Exception:
+            return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            index_rows = list(pool.map(idx, INDICES.items()))
+            mover_rows = [r for r in pool.map(stk, MOVER_BASKET)] if movers else []
+
+        mover_rows = sorted([m for m in mover_rows if m], key=lambda x: x["change_pct"], reverse=True)
+        nifty = next((i for i in index_rows if i["name"] == "NIFTY 50" and "error" not in i), None)
+        mood = None
+        if nifty:
+            mood = "Positive" if nifty["change_pct"] > 0.3 else "Negative" if nifty["change_pct"] < -0.3 else "Flat"
+
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "market_mood": mood,
+            "indices": index_rows,
+            "top_gainers": mover_rows[:5],
+            "top_losers": mover_rows[::-1][:5],
+            "advancers": sum(1 for m in mover_rows if m["change_pct"] > 0),
+            "decliners": sum(1 for m in mover_rows if m["change_pct"] < 0),
+            "basket_size": len(mover_rows),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building market overview: {str(e)}")
