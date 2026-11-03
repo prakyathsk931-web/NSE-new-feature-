@@ -27,8 +27,49 @@ def history(s, period="2y"):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fundamentals(s):
-    try: return yf.Ticker(ticker(s)).info or {}
-    except Exception: return {}
+    """Fetch Yahoo Finance profile and annual/quarterly statements with fallbacks."""
+    symbol = ticker(s)
+    t = yf.Ticker(symbol)
+    result = {}
+
+    # Company profile: try both supported access patterns.
+    for getter in (lambda: t.get_info(), lambda: t.info):
+        try:
+            data = getter()
+            if isinstance(data, dict):
+                result.update({k: v for k, v in data.items() if v is not None})
+                if result:
+                    break
+        except Exception:
+            continue
+
+    # Try multiple yfinance statement properties; some versions/providers expose
+    # different property names or only quarterly statements.
+    statement_sources = {
+        "Income statement": ["income_stmt", "financials", "quarterly_income_stmt", "quarterly_financials"],
+        "Balance sheet": ["balance_sheet", "quarterly_balance_sheet"],
+        "Cash flow": ["cashflow", "cash_flow", "quarterly_cashflow", "quarterly_cash_flow"],
+    }
+    for label, attrs in statement_sources.items():
+        found = False
+        for attr in attrs:
+            try:
+                frame = getattr(t, attr)
+                if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                    continue
+                # Latest period is normally the first column in yfinance.
+                latest_col = frame.columns[0]
+                for metric, value in frame[latest_col].items():
+                    if pd.notna(value):
+                        try:
+                            result[f"{label}:{metric}"] = float(value)
+                        except (TypeError, ValueError):
+                            result[f"{label}:{metric}"] = str(value)
+                found = True
+                break
+            except Exception:
+                continue
+    return result
 
 def rsi(series, n=14):
     d=series.diff()
@@ -298,17 +339,30 @@ with tabs[6]:
 
 
 with tabs[7]:
-    st.subheader("Fundamental data")
-    fields=[("Company","longName"),("Sector","sector"),("Industry","industry"),("Trailing P/E","trailingPE"),("Forward P/E","forwardPE"),("Price/book","priceToBook"),("EPS","trailingEps"),("ROE","returnOnEquity"),("Profit margin","profitMargins"),("Revenue growth","revenueGrowth"),("Debt/equity","debtToEquity"),("Dividend yield","dividendYield"),("Market cap","marketCap"),("52-week high","fiftyTwoWeekHigh"),("52-week low","fiftyTwoWeekLow")]
-    rows=[]
-    for label,key in fields:
+    st.subheader(f"Fundamental analysis: {symbol}")
+    st.caption("Displays the latest company profile and financial-statement figures supplied by the data provider. Some metrics may not be reported for every company.")
+    profile_fields=[("Company","longName"),("Sector","sector"),("Industry","industry"),("Trailing P/E","trailingPE"),("Forward P/E","forwardPE"),("Price/book","priceToBook"),("EPS","trailingEps"),("ROE","returnOnEquity"),("Profit margin","profitMargins"),("Revenue growth","revenueGrowth"),("Debt/equity","debtToEquity"),("Dividend yield","dividendYield"),("Market cap","marketCap"),("52-week high","fiftyTwoWeekHigh"),("52-week low","fiftyTwoWeekLow")]
+    profile_rows=[]
+    for label,key in profile_fields:
         val=info.get(key)
         if val is not None:
             if key in ["returnOnEquity","profitMargins","revenueGrowth","dividendYield"]: val=f"{val*100:.2f}%"
             elif key=="marketCap": val=f"₹{val:,.0f}"
-            rows.append({"Metric":label,"Value":val})
-    if rows: st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-    else: st.info("Fundamental information is unavailable for this ticker from the current provider.")
+            profile_rows.append({"Metric":label,"Value":val})
+    if profile_rows:
+        st.markdown("#### Company profile and valuation")
+        st.dataframe(pd.DataFrame(profile_rows),use_container_width=True,hide_index=True)
+    statement_groups=[("Income statement", "Income statement:"),("Balance sheet", "Balance sheet:"),("Cash flow", "Cash flow:")]
+    statement_found=False
+    for title,prefix in statement_groups:
+        legacy={"Income statement":"IS:","Balance sheet":"BS:","Cash flow":"CF:"}[title]
+        statement_rows=[{"Metric":k[len(prefix):] if k.startswith(prefix) else k[len(legacy):],"Latest reported value":v} for k,v in info.items() if k.startswith(prefix) or k.startswith(legacy)]
+        if statement_rows:
+            statement_found=True
+            st.markdown(f"#### {title}")
+            st.dataframe(pd.DataFrame(statement_rows),use_container_width=True,hide_index=True)
+    if not profile_rows and not statement_found:
+        st.warning("The data provider did not return fundamental data for this symbol. Check the NSE ticker spelling or try again later. This can happen when Yahoo Finance has incomplete coverage for the company.")
 
 
 with tabs[8]:
